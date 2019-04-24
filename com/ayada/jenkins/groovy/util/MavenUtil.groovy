@@ -1,5 +1,7 @@
 #!groovy
 
+package com.ayada.jenkins.groovy.util;
+
 def mvnBuildJar(pomFldr, skipTestFlag ) {
     def mvnBuildCommand = "mvn " +
                           " clean package " +
