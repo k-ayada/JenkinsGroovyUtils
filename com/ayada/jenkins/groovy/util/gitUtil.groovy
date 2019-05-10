@@ -1,4 +1,4 @@
-
+#!groovy
 import groovy.json.JsonSlurper;
 
 def getProjects(gitUrl,group_name,private_token) {
