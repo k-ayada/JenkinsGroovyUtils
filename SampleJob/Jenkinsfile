@@ -2,75 +2,125 @@
 
 @Library(value='pipeline_lib@master', changelog=false) _
 
-import groovy.json.JsonSlurper
-​import groovy.json.JsonOutput.*
-import com.easy.scm.*
+import groovy.json.JsonSlurper;
+import groovy.json.JsonOutput;
+import static groovy.io.FileType.* ;
+import com.easy.scm.*;
 
-
-def ENV_MAP = [:]
+ENV_MAP = [:]
 
 //http://<jenkins_url>.com/pipeline-syntax/globals#env
 
-Map getPropertiesFromConfigFile(filename)
-{
-	def Map propsMap = [:]
+def getPropertiesFromConfigFile(filename) {
+    def Map propsMap = [:]
     def cfgFile = [configFile(fileId: filename, variable: 'props')]
-	configFileProvider(cfgFile){
-         println "class of  cfgFile: ${cfgFile.getClass()}"
-		 propsMap = readProperties file:  "${env.props}"
-	}
+    configFileProvider(cfgFile){
+        propsMap = readProperties file:  "${env.props}"
+    }
     println "getPropertiesFromConfigFile(): Properties read from ${filename}"
-    prettyPrint(toJson(propsMap))​
-	return propsMap
+    println JsonOutput.prettyPrint(JsonOutput.toJson(propsMap))
+    ENV_MAP.putAll(propsMap)
 }
+def awsAssumeRoleAnGetCreds() {
+    println "Getting the temporary credentials from AWS"
+    def cmd   = 'aws sts assume-role' +
+                " --role-arn arn:aws:iam::${ENV_MAP['AWS_ACCOUNT_ID'].trim()}:role/${ENV_MAP['AWS_JENKINS_ROLE'].trim()}" +
+                " --role-session-name deploy-${params.GIT_GROUP}_${params.GIT_PROJECT}" +
+                ' --duration-seconds 3600'
 
-def getBuildProperties(){
-    def result = getPropertiesFromConfigFile(params.JOB_CONFIG)
-    switch(env.BRANCH_NAME) {
+    println "Running the command to get temporary credentials,\n\t ${cmd}"
+    def resJson = sh(returnStdout: true, script: cmd)
+    def resMap  = new JsonSlurper().parseText(resJson)['Credentials']
+    ENV_MAP['AWS_ACCESS_KEY_ID']     = resMap['AccessKeyId']
+    ENV_MAP['AWS_SECRET_ACCESS_KEY'] = resMap['SecretAccessKey']
+    ENV_MAP['AWS_SESSION_TOKEN']     = resMap['SessionToken']
+}
+def getBuildProperties() {
+    getPropertiesFromConfigFile(params.JOB_CONFIG)
+    println ("running switch against the params.GIT_BRANCH : ${params.GIT_BRANCH}")
+    switch(params.GIT_BRANCH) {
         case 'master':
-            result['BUILD_ENV']  = 'prod'
+            ENV_MAP['BUILD_ENV']  = 'prod'
             break
         case 'uat':
-            result['BUILD_ENV']  = 'uat'
+            ENV_MAP['BUILD_ENV']  = 'uat'
             break
         case 'qa':
-            result['BUILD_ENV']  = 'qa'
+            ENV_MAP['BUILD_ENV']  = 'qa'
             break
         default:
-            result['BUILD_ENV']  = 'dev'
-        break
-
-        result['AWS_ACCOUNT_ID']  = result["AWS_ACCOIND_ID_${result['BUILD_ENV']}"]
+            ENV_MAP['BUILD_ENV']  = 'dev'
+            break
     }
-    return result
-}
+    ENV_MAP['PROJECT_ROOT']     = "${pwd()}/${params.GIT_PROJECT}"
+    ENV_MAP['AWS_ACCOUNT_ID']   = ENV_MAP["AWS_ACCOUNT_ID_${ENV_MAP['BUILD_ENV']}"]
+    ENV_MAP['AWS_JENKINS_ROLE'] = ENV_MAP["AWS_JENKINS_ROLE_${ENV_MAP['BUILD_ENV']}"]
 
+    println "Derived the ENV_MAP['AWS_ACCOUNT_ID'] as : ${ENV_MAP['AWS_ACCOUNT_ID']}"
+    println "Derived the ['AWS_JENKINS_ROLE']      as : ${ENV_MAP['AWS_JENKINS_ROLE']}"
+
+    sh(script: "mkdir -p ${ENV_MAP['PROJECT_ROOT']}", returnStdout: true)
+
+    awsAssumeRoleAnGetCreds()
+    println "Final list of environemnt variables,"
+    println JsonOutput.prettyPrint(JsonOutput.toJson(ENV_MAP))
+}
 def getProjects(group_name) {
   cmd = "curl ${ENV_MAP['GIT_REST_API_ROOT']}/groups/${group_name}/projects?private_token=${ENV_MAP['GIT_PRIVATE_TOKEN']}"
-  println "getBranches() : Running the comamnd: ${cmd}"
+  println "getProjects() : Running the comamnd: ${cmd}"
   try {
-        response = sh(script: cmd, returnStdout: true )
-        respObj = new JsonSlurper().parseText(response)
+        def response = sh(script: cmd, returnStdout: true ).trim()
+        def respObj = new JsonSlurper().parseText(response)
         def projects = respObj.collect {it.name}
         return projects
     } catch(Exception e){
-        e.printStackTrace()
+        println "Caught Exception: " + e.getClass()
+        println "Message         : " + e.getMessage()
+        println "StackTrace,\n" + e.toString()
         return null
     }
- }
+}
 
 def getBranches(repo_name) {
   cmd = "curl ${ENV_MAP['GIT_REST_API_ROOT']}/projects/${repo_name}/repository/branches?private_token=${ENV_MAP['GIT_PRIVATE_TOKEN']}"
   println "getBranches() : Running the comamnd: ${cmd}"
   try{
-        response = sh(script: cmd, returnStdout: true )
-        respObj = new JsonSlurper().parseText(response)
-        branches = respObj.collect {it.name}
+        def response = sh(script: cmd, returnStdout: true ).trim()
+        def respObj = new JsonSlurper().parseText(response)
+        def branches = respObj.collect {it.name}
         return branches
     } catch(Exception e){
-        e.printStackTrace()
+        println "Caught Exception: " + e.getClass()
+        println "Message         : " + e.getMessage()
+        println "StackTrace,\n" + e.toString()
         return null
     }
+}
+
+def checkoutFromGit() {
+
+    def cmd     = "ls -lR ${ENV_MAP['PROJECT_ROOT']}"
+    def gitUtil = new GitUtil()
+    def repo    = "${params.GIT_GROUP}/${params.GIT_PROJECT}"
+    def url     = "${ENV_MAP['GIT_URL']}/${repo}.git"
+
+    println "Checking out branch ${params.GIT_BRANCH} from ${ENV_MAP['GIT_SSH_URL']}:${repo}"
+    checkout([  $class                           : 'GitSCM',
+                doGenerateSubmoduleConfigurations: false,
+                submoduleCfg                     : [],
+                branches                         : [[name: params.GIT_BRANCH]],
+                extensions                       : [[$class          : 'RelativeTargetDirectory',
+                                                    relativeTargetDir: "${ENV_MAP['PROJECT_ROOT']}"]],
+
+                userRemoteConfigs                : [[credentialsId: ENV_MAP['GIT_CREDENTIALS_ID'],
+                                                    url           : url]]
+
+            ])
+    def output = sh(script: cmd, returnStdout: true).trim()
+    def shortCommit = sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
+    println "Last commit info (short form),"
+    println shortCommit
+    println "content in the Current working Directory: ${ENV_MAP['PROJECT_ROOT']} is, \n ${output}"
 }
 
 pipeline {
@@ -85,33 +135,43 @@ pipeline {
         stage('Setup environment') {
             steps {
                 script {
-                    ENV_MAP = getBuildProperties()
-                    print("Finla list of environemnt variables,")
-                    prettyPrint(toJson(ENV_MAP))​
+                    getBuildProperties()
                 }
             }
         }
         stage('Checkout from Git') {
             steps {
                 script {
-                    gitUtil = new GitUtil()
-                    repo = "${params.GIT_GROUP}/${params.GIT_PROJECT}" //.replace("/", "%2F")
-                    println "Checking out branch ${params.GIT_BRANCH} from ${ENV_MAP['GIT_SSH_URL']}:${repo}"
-                    gitUtil.checkout(params.GIT_BRANCH
-                                    ,"${ENV_MAP['GIT_SSH_URL']}:${repo}"
-                                    ,ENV_MAP['GIT_CREDENTIALS_ID']
-                                    , "./${params.GIT_PROJECT}")
+                    checkoutFromGit()
                 }
             }
         }
-        stage('Build') {
+        stage('Build And Deploy') {
             steps {
-                println "TODO: Add logic to run the build"
-            }
-        }
-        stage('Deploy') {
-            steps{
-                println "TODO: Add logic to run the deploy"
+                script {
+                   def filePath = "${ENV_MAP['PROJECT_ROOT']}/build/buildNDeploy.groovy"
+                   def exists = fileExists filePath
+                   if (exists) {
+                       def awsMap   = [AWS_S3_DEPLOY_URI     : ENV_MAP['AWS_S3_DEPLOY_URI'],
+                                       AWS_ACCESS_KEY_ID     : ENV_MAP['AWS_ACCESS_KEY_ID'],
+                                       AWS_SECRET_ACCESS_KEY : ENV_MAP['AWS_SECRET_ACCESS_KEY'] ,
+                                       AWS_SESSION_TOKEN     : ENV_MAP['AWS_SESSION_TOKEN']
+                                      ]
+                       def buildMap = [PROJECT_ROOT    : ENV_MAP['PROJECT_ROOT'],
+                                       BUILD_ENV       : ENV_MAP['BUILD_ENV'],
+                                       BUILD_SKIP_TEST : params.get('SKIP_TEST','true'),
+                                       GIT_BRANCH      : params.GIT_BRANCH,
+                                       NEXUS_URL       : ENV_MAP['NEXUS_URL'],
+                                       REBUILD_JAR     : params.get('REBUILD_JAR','false'),
+                                       DEPLOY_TO_NEXUS : params.get('DEPLOY_TO_NEXUS','false'),
+                                       DEPLOY_FAT_JAR  : params.get('DEPLOY_FAT_JAR','false')
+                                      ]
+                       //bnd = load "${filePath}"
+                       //println "Script ${filePath} loaded. Runnig the method buildNDeployToNexusAnsS3()"
+                       //bnd.buildNDeployToNexusAnsS3( buildMap, awsMap)
+                       buildNDeployToNexusAnsS3( buildMap, awsMap)
+                   }
+                }
             }
         }
     }
@@ -140,4 +200,156 @@ pipeline {
         }
         //changed { }
     }
+}
+
+/*--------------------------------------*/
+/*
+  Deploys the the jar file to Nexus Repo
+  parms,
+    1. nexusURL : URL of the nexus repo
+    2. pom      : POM object
+*/
+def mvnDeployToNexus(nexusURL,pom,jarPath, builEnv, deployFatJat ) {
+    def jarFls = sh(returnStdout: true, script: "ls ${jarPath}/*.jar").trim().split("\n")
+
+    println("List of jar files,\n ${jarFls}")
+    def dVersion = pom.version
+    if ( deployFatJat == 'true' && jarFls.size() > 1  ) {
+       dVersion = "${dVersion}-jar-with-dependencies"
+    }
+    def jarName  = "${pom.artifactId}-${dVersion}.jar"
+
+    def jarFl = "${pom.artifactId}-${dVersion}.jar"
+    def mvnDeployCommandVer = "mvn deploy:deploy-file"          +
+                              " -Durl=${nexusURL}"              +
+                              " -DgroupId=${pom.groupId} "      +
+                              " -DartifactId=${pom.artifactId}" +
+                              " -Dversion=${dVersion}-SNAPSHOT" +
+                              " -Dpackaging=${pom.packaging}"   +
+                              " -Dfile=${jarPath}/${jarFl}"
+    def mvnDeployCommandEnv = "mvn deploy:deploy-file"          +
+                              " -Durl=${nexusURL}"              +
+                              " -DgroupId=${pom.groupId} "      +
+                              " -DartifactId=${pom.artifactId}" +
+                              " -Dversion=${builEnv}-SNAPSHOT"  +
+                              " -Dpackaging=${pom.packaging}"   +
+                              " -Dfile=${jarPath}/${jarFl}"
+    try{
+        echo "Running Maven comamnd to Upload the Jar.\n cmd>> ${mvnDeployCommandVer}"
+        def outputVer = sh(returnStdout: true, script: mvnDeployCommandVer)
+        echo "Running Maven comamnd to Upload the Jar.\n cmd>> ${mvnDeployCommandEnv}"
+        def outputEnv = sh(returnStdout: true, script: mvnDeployCommandEnv)
+    } catch(Exception e) {
+        println "Caught Exception: " + e.getClass()
+        println "Message         : " + e.getMessage()
+        println "StackTrace,\n"      + e.toString()
+        sh "exit 1"
+    }
+}
+def mvnPullFromNexus(nexusURL,pom, folder, buildEnv) {
+    def cmd = "cd ${folder}; ls -ltr ; rm -Rf ./*; ls -ltr"
+    println "Running the command ${cmd}"
+    def out = sh(returnStdout: true, script: cmd).trim()
+    println "Result from cleaning up the path ${folder},\n ${out}"
+
+    def retryWithVersion = false
+    try {
+        def pullVersion = 'qa'
+        if (buildEnv == 'prod') {
+           pullVersion = 'uat'
+        }
+        def mvnPullCommand = "mvn dependency:get" +
+                            " -DremoteRepositories=${nexusURL}" +
+                            " -Dartifact=${pom.groupId}:${pom.artifactId}:${pom.version}:${pom.packaging}"+
+                            " -Ddest=${folder}"
+        echo "Running Maven comamnd to Pull the Jar.\n cmd>> ${mvnPullCommand}"
+        sh(returnStdout: true, script: mvnPullCommand).trim()
+
+    } catch(Exception e) {
+        println "Caught Exception: " + e.getClass()
+        println "Message         : " + e.getMessage()
+        println "StackTrace,\n"      + e.toString()
+        retryWithVersion = true
+    }
+
+    try {
+        def mvnPullCommand = "mvn dependency:get" +
+                            " -DremoteRepositories=${nexusURL}" +
+                            " -Dartifact=${pom.groupId}:${pom.artifactId}:${pom.version}:${pom.packaging}"+
+                            " -Ddest=${folder}"
+        echo "Running Maven comamnd to Pull the Jar.\n cmd>> ${mvnPullCommand}"
+        sh(returnStdout: true, script: mvnPullCommand).trim()
+    } catch(Exception e) {
+        println "Caught Exception: " + e.getClass()
+        println "Message         : " + e.getMessage()
+        println "StackTrace,\n"      + e.toString()
+        sh "exit 1"
+    }
+
+    def cmdLs = "ls -ltr ${folder}/*"
+    println "Running the command ${cmd}"
+    def outLS = sh(returnStdout: true, script: cmdLs).trim()
+    println "List of files downloaded into ${folder},\n ${outLS}"
+}
+
+def mvnBuildJar(pomLoc, skipTestFlag ) {
+
+    def mvnBuildCommand = "mvn " +
+                          " clean package " +
+                          " -Dmaven.test.skip=${skipTestFlag}" +
+                          " -f ${pomLoc}/pom.xml"
+    echo "Maven command: ${mvnBuildCommand}"
+    try{
+        def mvnOut = sh(returnStdout: true, script: mvnBuildCommand).trim()
+        println "Output from Maven build,\n ${mvnOut}"
+        def lscmd = "ls -ltrh ${pomLoc}/target"
+        def out = sh(returnStdout: true, script: lscmd).trim()
+        println "List of files in the dir ${pomLoc}/target\n ${out}"
+    } catch(Exception e) {
+        println "Caught Exception: " + e.getClass()
+        println "Message         : " + e.getMessage()
+        println "StackTrace,\n" + e.toString()
+        sh "exit 1"
+    }
+}
+
+def buildNDeployToNexusAnsS3( buildMap, awsMap) {
+/*
+    buildMap = {'PROJECT_ROOT': '', 'BUILD_ENV' :'', 'BUILD_SKIP_TEST' :'', 'GIT_BRANCH' :'', 'NEXUS_URL' :'', 'REBUILD_JAR': '' ,'DEPLOY_TO_NEXUS' : '', 'DEPLOY_FAT_JAR': ''}
+    awsMap   = {'AWS_ACCESS_KEY_ID': '', 'AWS_SECRET_ACCESS_KEY': '', 'AWS_SESSION_TOKEN': '', 'AWS_S3_DEPLOY_URI': ''}
+*/
+    sh "cd ${buildMap['PROJECT_ROOT']}"
+    def findScript = 'echo $(dirname "$(find  ' + buildMap['PROJECT_ROOT'] + ' -name pom.xml | head -1)")'
+    def mvnLoc =  sh(returnStdout: true, script: findScript).trim().replaceAll("[\r\n]+","")
+    println "Found the pom.xml in ${mvnLoc}"
+    def archPath = "${mvnLoc}/target"
+    def skipTest = ""
+    if ( buildMap['BUILD_SKIP_TEST'] == "true" ) {
+        skipTest = "-Dmaven.test.skip=true"
+    }
+    sh "cd ${mvnLoc}"
+    def pom = readMavenPom file: "${mvnLoc}/pom.xml"
+    print "POM build props: {'artifactId' : '${pom.artifactId}' , 'groupId' : '${pom.groupId}'  , 'version' : '${pom.version}' }"
+
+    AWS_CRED_STR =  " AWS_ACCESS_KEY_ID=${awsMap['AWS_ACCESS_KEY_ID']}"+
+                    " AWS_SECRET_ACCESS_KEY=${awsMap['AWS_SECRET_ACCESS_KEY']}"+
+                    " AWS_SESSION_TOKEN=${awsMap['AWS_SESSION_TOKEN']}"
+
+    def jarPath = ''
+    if ( buildMap['BUILD_ENV'] in ['dev', 'qa'] || buildMap['REBUILD_JAR'] == 'true') {
+        mvnBuildJar(mvnLoc, buildMap.get('BUILD_SKIP_TEST', 'false'))
+        jarPath = archPath
+    } else if ( buildMap['BUILD_ENV'] in ['uat', 'prod']  ) {
+        mvnPullFromNexus(nexusURL,pom,buildMap['PROJECT_ROOT'])
+        jarPath = buildMap['PROJECT_ROOT']
+    }
+
+    if (buildMap['DEPLOY_TO_NEXUS'] == 'true') {
+        mvnDeployToNexus(buildMap['NEXUS_URL'],pom, jarPath,buildMap['BUILD_ENV'] ,buildMap['DEPLOY_FAT_JAR'])
+    }
+
+    def cmd = """${AWS_CRED_STR} aws s3 cp ${jarPath} ${awsMap['AWS_S3_DEPLOY_URI'].replace('{env}', buildMap['BUILD_ENV'])} --recursive --exclude "*" --include "*.jar" """
+    println "Running the command, \n\t${cmd}"
+    def out = sh(returnStdout: true, script: cmd).trim()
+    println "Result from S3 cp cli,\n ${out}"
 }
