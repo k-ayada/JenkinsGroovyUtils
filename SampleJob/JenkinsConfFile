@@ -17,3 +17,6 @@ AWS_JENKINS_ROLE_prod=abc/apps/prod-JenkinsRole
 AWS_S3_DEPLOY_URI=s3://{env}-abc-artifacts-<awsRegion>/Jars
 
 NEXUS_URL=http://<nexusreporurl>.com/repository/maven-release
+
+EMAIL_SUCCESS=<user>@<domain>.com
+EMAIL_FAIL=<user>@<domain>.com
