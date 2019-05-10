@@ -1,0 +1,143 @@
+#!groovy
+
+@Library(value='pipeline_lib@master', changelog=false) _
+
+import groovy.json.JsonSlurper
+​import groovy.json.JsonOutput.*
+import com.easy.scm.*
+
+
+def ENV_MAP = [:]
+
+//http://<jenkins_url>.com/pipeline-syntax/globals#env
+
+Map getPropertiesFromConfigFile(filename)
+{
+	def Map propsMap = [:]
+    def cfgFile = [configFile(fileId: filename, variable: 'props')]
+	configFileProvider(cfgFile){
+         println "class of  cfgFile: ${cfgFile.getClass()}"
+		 propsMap = readProperties file:  "${env.props}"
+	}
+    println "getPropertiesFromConfigFile(): Properties read from ${filename}"
+    prettyPrint(toJson(propsMap))​
+	return propsMap
+}
+
+def getBuildProperties(){
+    def result = getPropertiesFromConfigFile(params.JOB_CONFIG)
+    switch(env.BRANCH_NAME) {
+        case 'master':
+            result['BUILD_ENV']  = 'prod'
+            break
+        case 'uat':
+            result['BUILD_ENV']  = 'uat'
+            break
+        case 'qa':
+            result['BUILD_ENV']  = 'qa'
+            break
+        default:
+            result['BUILD_ENV']  = 'dev'
+        break
+
+        result['AWS_ACCOUNT_ID']  = result["AWS_ACCOIND_ID_${result['BUILD_ENV']}"]
+    }
+    return result
+}
+
+def getProjects(group_name) {
+  cmd = "curl ${ENV_MAP['GIT_REST_API_ROOT']}/groups/${group_name}/projects?private_token=${ENV_MAP['GIT_PRIVATE_TOKEN']}"
+  println "getBranches() : Running the comamnd: ${cmd}"
+  try {
+        response = sh(script: cmd, returnStdout: true )
+        respObj = new JsonSlurper().parseText(response)
+        def projects = respObj.collect {it.name}
+        return projects
+    } catch(Exception e){
+        e.printStackTrace()
+        return null
+    }
+ }
+
+def getBranches(repo_name) {
+  cmd = "curl ${ENV_MAP['GIT_REST_API_ROOT']}/projects/${repo_name}/repository/branches?private_token=${ENV_MAP['GIT_PRIVATE_TOKEN']}"
+  println "getBranches() : Running the comamnd: ${cmd}"
+  try{
+        response = sh(script: cmd, returnStdout: true )
+        respObj = new JsonSlurper().parseText(response)
+        branches = respObj.collect {it.name}
+        return branches
+    } catch(Exception e){
+        e.printStackTrace()
+        return null
+    }
+}
+
+pipeline {
+    agent { label 'jnlp-slave-multitool' }
+    options {
+        timeout(time: 1, unit: 'HOURS')
+        skipStagesAfterUnstable()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr:'1')) // Only keep the most recent builds
+    }
+    stages {
+        stage('Setup environment') {
+            steps {
+                script {
+                    ENV_MAP = getBuildProperties()
+                    print("Finla list of environemnt variables,")
+                    prettyPrint(toJson(ENV_MAP))​
+                }
+            }
+        }
+        stage('Checkout from Git') {
+            steps {
+                script {
+                    gitUtil = new GitUtil()
+                    repo = "${params.GIT_GROUP}/${params.GIT_PROJECT}" //.replace("/", "%2F")
+                    println "Checking out branch ${params.GIT_BRANCH} from ${ENV_MAP['GIT_SSH_URL']}:${repo}"
+                    gitUtil.checkout(params.GIT_BRANCH
+                                    ,"${ENV_MAP['GIT_SSH_URL']}:${repo}"
+                                    ,ENV_MAP['GIT_CREDENTIALS_ID']
+                                    , "./${params.GIT_PROJECT}")
+                }
+            }
+        }
+        stage('Build') {
+            steps {
+                println "TODO: Add logic to run the build"
+            }
+        }
+        stage('Deploy') {
+            steps{
+                println "TODO: Add logic to run the deploy"
+            }
+        }
+    }
+    post {
+        always {
+            cleanWs()  //This will always run
+        }
+        success {
+            println "Build completed sucessfully"
+            mail to: ENV_MAP['email_success'],
+            subject: "Successful Pipeline: ${currentBuild.fullDisplayName}",
+            body: "Build completed successfully. Build URL: ${env.BUILD_URL}"
+
+        }
+        failure {
+            println "Build Failed."
+            mail to: ENV_MAP['email_fail'],
+            subject: "Failed Pipeline: ${currentBuild.fullDisplayName}",
+            body: "Something is wrong with ${env.BUILD_URL}"
+        }
+        unstable {
+            echo 'This will run only if the run was marked as unstable'
+            mail to: ENV_MAP['email_fail'],
+            subject: "Unstable Pipeline: ${currentBuild.fullDisplayName}",
+            body: "Something is wrong with ${env.BUILD_URL}"
+        }
+        //changed { }
+    }
+}
